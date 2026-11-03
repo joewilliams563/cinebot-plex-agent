@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+requests
+qbittorrent-api
+plexapi
+google-genai
+pydantic-settings
+python-dotenv
+chainlit
+fastmcp
+pytest
+httpx

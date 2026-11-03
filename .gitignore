@@ -1,0 +1,29 @@
+# Environment & Secrets (NEVER commit .env)
+.env
+*.env
+!.env.example
+
+# Container runtime state & databases (contains Radarr/Prowlarr/qBittorrent keys & DBs)
+config/
+
+# Python virtual environments & caches
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Chainlit local runtime state
+.chainlit/
+.files/
+chainlit.md
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,90 @@
+services:
+  # 1. Windscribe VPN Tunnel (Network Gateway for qBittorrent)
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "8080:8080" # qBittorrent Web UI port (exposed via Gluetun)
+      - "6881:6881"
+      - "6881:6881/udp"
+    environment:
+      - VPN_SERVICE_PROVIDER=windscribe
+      - VPN_TYPE=wireguard # Or openvpn
+      - WIREGUARD_PRIVATE_KEY=${WINDSCRIBE_WG_PRIVATE_KEY}
+      - WIREGUARD_ADDRESSES=${WINDSCRIBE_WG_ADDRESS}
+      - WIREGUARD_PRESHARED_KEY=${WINDSCRIBE_WG_PRESHARED_KEY}
+      - SERVER_REGIONS=US East
+      - TZ=America/New_York
+    restart: unless-stopped
+
+  # 2. qBittorrent (100% hard-bound to Gluetun's network stack)
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    network_mode: "service:gluetun" # Routes ALL traffic through Windscribe
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+      - WEBUI_PORT=8080
+    volumes:
+      - ./config/qbittorrent:/config
+      - C:/PlexMedia:/data # Shared root volume so Radarr hardlinks work instantly
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 3. Prowlarr (Indexer Manager)
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    container_name: prowlarr
+    ports:
+      - "9696:9696"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - ./config/prowlarr:/config
+    restart: unless-stopped
+
+  # 4. Radarr (Movie Automation & Plex Mover)
+  radarr:
+    image: lscr.io/linuxserver/radarr:latest
+    container_name: radarr
+    ports:
+      - "7878:7878"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/New_York
+    volumes:
+      - ./config/radarr:/config
+      - C:/PlexMedia:/data # Matches qBittorrent's /data mount for instant hardlinks
+    restart: unless-stopped
+
+  # 5. CineBot AI Agent & Chat UI
+  cinebot:
+    build: .
+    container_name: cinebot
+    ports:
+      - "8000:8000" # FastAPI Webhook & API
+      - "8501:8501" # Chainlit Chat Frontend
+    env_file:
+      - .env
+    environment:
+      - RADARR_URL=http://radarr:7878/api/v3
+      - QBIT_HOST=gluetun
+      - QBIT_PORT=8080
+      - PLEX_ROOT_FOLDER=/data/Movies
+      - VPN_INTERFACE=tun0
+      - PLEX_URL=http://host.docker.internal:32400 # Reaches Plex running on Windows host
+    depends_on:
+      - radarr
+      - gluetun
+    restart: unless-stopped
