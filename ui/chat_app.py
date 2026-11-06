@@ -1,6 +1,7 @@
-"""Chainlit frontend for CineBot displaying VPN status badge, movie posters, and live download progress."""
+"""Chainlit frontend for CineBot displaying VPN status badge, movie posters, and in-place live download progress."""
 
 import asyncio
+from datetime import datetime
 import logging
 from pathlib import Path
 import re
@@ -13,6 +14,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 import chainlit as cl
+import qbittorrentapi
 
 from app.agent import CineBotAgent
 from app.config import settings
@@ -67,19 +69,93 @@ def format_vpn_badge(vpn_status: dict[str, Any]) -> str:
     return "🛡️ **VPN Status**: `🔴 UNSECURED — Kill-Switch Active (Downloads Blocked)`"
 
 
-def format_queue_summary(queue_data: dict[str, Any]) -> str:
-    """Format active Radarr/qBittorrent download queue items into a clear Markdown summary."""
-    items = queue_data.get("queue", [])
-    if not items:
-        return (
-            "📡 **Radarr & qBittorrent Status**: Searching indexers (YTS / PirateBay / LimeTorrents via Prowlarr). "
-            "Click **🔄 Refresh Download Status** below in a few seconds to check torrent progress & ETA."
+def _render_progress_bar(percent: float, width: int = 12) -> str:
+    """Build a compact Unicode progress bar for the given percentage."""
+    clamped = max(0.0, min(100.0, percent))
+    filled = int(round((clamped / 100.0) * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _format_eta(seconds: int | None, fallback: str = "Calculating...") -> str:
+    """Convert qBittorrent ETA seconds into human-readable HH:MM:SS."""
+    if seconds is None or seconds < 0 or seconds >= 8640000:
+        return fallback
+    hrs, rem = divmod(int(seconds), 3600)
+    mins, secs = divmod(rem, 60)
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def _fetch_live_qbit_torrents() -> list[dict[str, Any]]:
+    """Query qBittorrent directly for real-time torrent progress, speed, seeds, and state."""
+    try:
+        client = qbittorrentapi.Client(
+            host=settings.QBIT_HOST,
+            port=settings.QBIT_PORT,
+            username=settings.QBIT_USER,
+            password=settings.QBIT_PASS,
         )
-    lines = [f"📥 **Active Downloads ({len(items)})**:"]
-    for item in items:
+        try:
+            client.auth_log_in()
+        except Exception:
+            pass
+        torrents = client.torrents_info()
+        results: list[dict[str, Any]] = []
+        for t in torrents:
+            pct = round(float(getattr(t, "progress", 0.0)) * 100.0, 1)
+            dlspeed_mb = round(float(getattr(t, "dlspeed", 0.0)) / (1024 * 1024), 2)
+            eta_sec = getattr(t, "eta", None)
+            results.append(
+                {
+                    "name": getattr(t, "name", "Unknown"),
+                    "progress_percent": pct,
+                    "state": getattr(t, "state", "downloading"),
+                    "dlspeed_mb": dlspeed_mb,
+                    "seeds": getattr(t, "num_seeds", 0),
+                    "peers": getattr(t, "num_leechs", 0),
+                    "eta": _format_eta(eta_sec),
+                }
+            )
+        return results
+    except Exception as exc:
+        logger.debug("Live qBittorrent query skipped: %s", exc)
+        return []
+
+
+def format_queue_summary(
+    queue_data: dict[str, Any],
+    qbit_items: list[dict[str, Any]] | None = None,
+) -> str:
+    """Format active Radarr/qBittorrent download queue items into a clear Markdown summary."""
+    qbit_items = qbit_items or []
+    radarr_items = queue_data.get("queue", [])
+
+    if qbit_items:
+        lines = [f"📥 **Active Downloads ({len(qbit_items)})**:"]
+        for t in qbit_items:
+            pct = t["progress_percent"]
+            bar = _render_progress_bar(pct)
+            lines.append(
+                f"- **{t['name']}**\n"
+                f"  `{bar}` **{pct}%** | Speed: `{t['dlspeed_mb']} MB/s` | "
+                f"Seeds: `{t['seeds']}` | State: `{t['state']}` | ETA: `{t['eta']}`"
+            )
+        return "\n".join(lines)
+
+    if not radarr_items:
+        return (
+            "📡 **Radarr & qBittorrent Status**: No active downloads in queue "
+            "(either searching indexers or already imported into `/data/Movies`)."
+        )
+
+    lines = [f"📥 **Active Downloads ({len(radarr_items)})**:"]
+    for item in radarr_items:
+        pct = float(item.get("progress_percent", 0.0))
+        bar = _render_progress_bar(pct)
         lines.append(
-            f"- **{item.get('title')}** — `{item.get('progress_percent', 0)}%` "
-            f"| State: `{item.get('trackedDownloadState') or item.get('status')}` "
+            f"- **{item.get('title')}**\n"
+            f"  `{bar}` **{pct}%** | State: `{item.get('trackedDownloadState') or item.get('status')}` "
             f"| ETA: `{item.get('timeleft', 'Calculating...')}`"
         )
     return "\n".join(lines)
@@ -122,16 +198,22 @@ async def on_chat_start() -> None:
             label="🔄 Check Active Downloads",
         )
     ]
-    await cl.Message(content=welcome_md, actions=actions).send()
+    welcome_msg = cl.Message(content=welcome_md, actions=actions)
+    await welcome_msg.send()
 
 
 @cl.action_callback("check_queue")
 async def on_check_queue_action(action: cl.Action) -> None:
-    """Display live Radarr/qBittorrent download progress and ETA when clicked."""
+    """Update the existing download status message in-place instead of appending new messages."""
     vpn_status = await asyncio.to_thread(verify_windscribe_binding)
     badge = format_vpn_badge(vpn_status)
-    queue_data = await asyncio.to_thread(get_download_queue)
-    summary = format_queue_summary(queue_data)
+    queue_data, qbit_items = await asyncio.gather(
+        asyncio.to_thread(get_download_queue),
+        asyncio.to_thread(_fetch_live_qbit_torrents),
+    )
+    summary = format_queue_summary(queue_data, qbit_items)
+    now_str = datetime.now().strftime("%I:%M:%S %p")
+
     refresh_action = [
         cl.Action(
             name="check_queue",
@@ -139,7 +221,23 @@ async def on_check_queue_action(action: cl.Action) -> None:
             label="🔄 Refresh Download Status",
         )
     ]
-    await cl.Message(content=f"{badge}\n\n{summary}", actions=refresh_action).send()
+    header_prefix: str = cl.user_session.get("queue_header_prefix", "")
+    prefix_block = f"{header_prefix}\n\n" if header_prefix else ""
+    updated_content = (
+        f"{badge} | 🕒 *Last refreshed: `{now_str}`*\n\n"
+        f"{prefix_block}{summary}"
+    )
+
+    existing_msg: cl.Message | None = cl.user_session.get("queue_status_msg")
+    if existing_msg is not None:
+        existing_msg.content = updated_content
+        existing_msg.actions = refresh_action
+        await existing_msg.update()
+    else:
+        new_msg = cl.Message(content=updated_content, actions=refresh_action)
+        await new_msg.send()
+        cl.user_session.set("queue_status_msg", new_msg)
+
     await flush_webhook_notifications()
 
 
@@ -160,14 +258,22 @@ async def on_download_action(action: cl.Action) -> None:
 
     if result.get("success"):
         await asyncio.sleep(2.5)
-        queue_data = await asyncio.to_thread(get_download_queue)
-        queue_md = format_queue_summary(queue_data)
-        msg = (
-            f"{badge}\n\n"
+        queue_data, qbit_items = await asyncio.gather(
+            asyncio.to_thread(get_download_queue),
+            asyncio.to_thread(_fetch_live_qbit_torrents),
+        )
+        queue_md = format_queue_summary(queue_data, qbit_items)
+        now_str = datetime.now().strftime("%I:%M:%S %p")
+        header_info = (
             f"✅ **Movie Added & Search Triggered**: **{result.get('title', title)} "
             f"({result.get('year', '')})** (`tmdbId={tmdb_id}`)\n"
             f"- **Plex Destination**: `{result.get('rootFolderPath', '/data/Movies')}`\n"
-            f"- **Monitored**: `{result.get('monitored', True)}` | **Download Client**: `qBittorrent (Gluetun tun0)`\n\n"
+            f"- **Monitored**: `{result.get('monitored', True)}` | **Download Client**: `qBittorrent (Gluetun tun0)`"
+        )
+        cl.user_session.set("queue_header_prefix", header_info)
+        msg = (
+            f"{badge} | 🕒 *Last refreshed: `{now_str}`*\n\n"
+            f"{header_info}\n\n"
             f"{queue_md}"
         )
         actions = [
@@ -177,16 +283,19 @@ async def on_download_action(action: cl.Action) -> None:
                 label="🔄 Refresh Download Status",
             )
         ]
+        status_msg.content = msg
+        status_msg.actions = actions
+        await status_msg.update()
+        cl.user_session.set("queue_status_msg", status_msg)
     else:
         msg = (
             f"{badge}\n\n"
             f"🛑 **Download Aborted for {title}**: {result.get('error', 'VPN check failed.')}"
         )
-        actions = []
+        status_msg.content = msg
+        status_msg.actions = []
+        await status_msg.update()
 
-    status_msg.content = msg
-    status_msg.actions = actions
-    await status_msg.update()
     await flush_webhook_notifications()
 
 
@@ -260,7 +369,6 @@ async def on_message(message: cl.Message) -> None:
                         )
                     )
 
-            # Immediately update the message so the user sees posters & Download buttons in <0.5s!
             if quick_preview_lines:
                 preview_md = "\n".join(quick_preview_lines)
                 thinking_msg.content = (
@@ -278,7 +386,7 @@ async def on_message(message: cl.Message) -> None:
         logger.exception("Chat error")
         reply_text = f"⚠️ Error communicating with agent: `{exc}`"
 
-    # Always attach a button to check active downloads when a download is discussed
+    has_queue_button = False
     if "download" in reply_text.lower() or user_text.lower().strip() in CONVERSATIONAL_REPLIES:
         actions.append(
             cl.Action(
@@ -287,10 +395,15 @@ async def on_message(message: cl.Message) -> None:
                 label="🔄 Refresh Download Status",
             )
         )
+        has_queue_button = True
 
     thinking_msg.content = f"{badge}\n\n{reply_text}"
     thinking_msg.elements = elements
     thinking_msg.actions = actions
     await thinking_msg.update()
+
+    if has_queue_button:
+        cl.user_session.set("queue_header_prefix", reply_text)
+        cl.user_session.set("queue_status_msg", thinking_msg)
 
     await flush_webhook_notifications()
