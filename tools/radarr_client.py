@@ -138,6 +138,33 @@ def trigger_movie_download(tmdb_id: int) -> dict[str, Any]:
     )
 
     root_folder = settings.PLEX_ROOT_FOLDER or DEFAULT_ROOT_FOLDER
+
+    # If the movie already has a Radarr library ID in lookup_data, trigger an active search for it
+    existing_id = movie_data.get("id")
+    if existing_id:
+        try:
+            requests.post(
+                f"{base_url}/command",
+                json={"name": "MoviesSearch", "movieIds": [int(existing_id)]},
+                headers=headers,
+                timeout=10,
+            )
+        except Exception as exc:
+            logger.debug("MoviesSearch command warning: %s", exc)
+        return {
+            "success": True,
+            "status": "searching_indexers",
+            "alreadyInLibrary": True,
+            "radarrId": existing_id,
+            "tmdbId": int(movie_data.get("tmdbId", tmdb_id)),
+            "title": movie_data.get("title", f"TMDB-{tmdb_id}"),
+            "year": movie_data.get("year", 0),
+            "rootFolderPath": movie_data.get("rootFolderPath") or root_folder,
+            "monitored": True,
+            "remotePoster": _extract_poster(movie_data),
+            "movie": movie_data,
+        }
+
     payload = {
         "title": movie_data.get("title", f"TMDB-{tmdb_id}"),
         "qualityProfileId": int(settings.QUALITY_PROFILE_ID),

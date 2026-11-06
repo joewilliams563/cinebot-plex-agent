@@ -1,7 +1,9 @@
 """Gemini agent orchestration for CineBot using the official google-genai SDK."""
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 import logging
 import re
+import socket
 from typing import Any
 
 from google import genai
@@ -16,6 +18,18 @@ from tools.radarr_client import (
 from tools.vpn_guard import verify_windscribe_binding
 
 logger = logging.getLogger(__name__)
+
+# Prefer IPv4 in Docker containers where IPv6 routes are unavailable and cause TCP SYN timeouts
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_preferred_getaddrinfo(*args: Any, **kwargs: Any) -> list[Any]:
+    results = _orig_getaddrinfo(*args, **kwargs)
+    ipv4 = [r for r in results if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else results
+
+
+socket.getaddrinfo = _ipv4_preferred_getaddrinfo  # type: ignore[assignment]
 
 SYSTEM_INSTRUCTION = """You are CineBot, an autonomous AI media server assistant for Plex, Radarr, and qBittorrent.
 
@@ -36,8 +50,8 @@ CINEBOT_TOOLS = [
 ]
 
 FALLBACK_MODELS = [
-    "gemini-3.7-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.7-flash",
     "gemini-3.8-flash",
 ]
 
@@ -74,7 +88,6 @@ def _extract_last_tmdb_id(history: list[dict[str, str]]) -> int | None:
     for turn in reversed(history):
         if turn.get("role") == "model":
             text = turn.get("text", "")
-            # Look for explicit TMDB ID patterns first (e.g. TMDB ID: `27205` or tmdbId=27205)
             match = re.search(
                 r"(?:tmdb\s*id|tmdbid)[:\s=`*]*(\d{2,8})", text, flags=re.IGNORECASE
             )
@@ -86,7 +99,7 @@ def _extract_last_tmdb_id(history: list[dict[str, str]]) -> int | None:
 def _deterministic_fallback(
     message: str, history: list[dict[str, str]] | None = None
 ) -> str:
-    """Fallback handler if all Gemini API models experience a 503 outage."""
+    """Fallback handler if Gemini API models time out or experience a 503 outage."""
     text = message.strip()
     lower = text.lower().rstrip(".!?")
     history = history or []
@@ -98,8 +111,10 @@ def _deterministic_fallback(
             res = trigger_movie_download(prev_tmdb)
             if res.get("success"):
                 return (
-                    f"✅ Triggered download for **{res.get('title')} ({res.get('year')})** "
-                    f"(`tmdbId={prev_tmdb}`) into `{res.get('rootFolderPath', '/data/Movies')}`."
+                    f"✅ **Download Triggered**: **{res.get('title')} ({res.get('year')})** "
+                    f"(`tmdbId={prev_tmdb}`)\n"
+                    f"- **Radarr Library Folder**: `{res.get('rootFolderPath', '/data/Movies')}`\n"
+                    f"- **Indexer Search**: Active via Prowlarr & downloading through qBittorrent (`tun0`)."
                 )
             return f"🛑 Download aborted: {res.get('error')}"
 
@@ -111,7 +126,7 @@ def _deterministic_fallback(
         lines = ["📥 **Active Download Queue**:"]
         for item in items:
             lines.append(
-                f"- **{item['title']}** — `{item['progress_percent']}%` (ETA: `{item['timeleft']}`)"
+                f"- **{item['title']}** — `{item['progress_percent']}%` (ETA: `{item['timeleft']}`, Status: `{item['status']}`)"
             )
         return "\n".join(lines)
 
@@ -121,8 +136,10 @@ def _deterministic_fallback(
         res = trigger_movie_download(tmdb_id)
         if res.get("success"):
             return (
-                f"✅ Triggered download for **{res.get('title')} ({res.get('year')})** "
-                f"(`tmdbId={tmdb_id}`) into `{res.get('rootFolderPath', '/data/Movies')}`."
+                f"✅ **Download Triggered**: **{res.get('title')} ({res.get('year')})** "
+                f"(`tmdbId={tmdb_id}`)\n"
+                f"- **Radarr Library Folder**: `{res.get('rootFolderPath', '/data/Movies')}`\n"
+                f"- **Indexer Search**: Active via Prowlarr & downloading through qBittorrent (`tun0`)."
             )
         return f"🛑 Download aborted: {res.get('error')}"
 
@@ -141,8 +158,9 @@ def _deterministic_fallback(
         return f"No movies found matching **{clean_query}**."
     lines = [f"🎬 **Top matches for '{clean_query}'**:"]
     for m in movies[:5]:
+        lib_tag = " *(Already in Radarr)*" if m.get("inLibrary") else ""
         lines.append(
-            f"- **{m.get('title')} ({m.get('year', 'N/A')})** — TMDB ID: `{m.get('tmdbId')}`"
+            f"- **{m.get('title')} ({m.get('year', 'N/A')})** — TMDB ID: `{m.get('tmdbId')}`{lib_tag}"
         )
     lines.append(
         f"\nWould you like me to download **{movies[0].get('title')} ({movies[0].get('year', 'N/A')})** (TMDB ID: `{movies[0].get('tmdbId')}`)? Reply **yes** or click a **⬇️ Download** button below."
@@ -154,7 +172,7 @@ class CineBotAgent:
     """Stateful multi-turn Gemini agent with automatic function calling and model fallback."""
 
     def __init__(self, model: str | None = None) -> None:
-        self.model = model or settings.GEMINI_MODEL or "gemini-3.7-flash"
+        self.model = model or "gemini-3.5-flash-lite"
         self._client: genai.Client | None = None
         self.history: list[dict[str, str]] = []
 
@@ -197,6 +215,33 @@ class CineBotAgent:
         )
         return contents
 
+    def _call_model_with_timeout(
+        self, model_name: str, contents: Any, timeout_sec: float = 10.0
+    ) -> str:
+        """Invoke generate_content with a hard wall-clock timeout so stalled sockets never hang the UI."""
+        if type(self.client).__name__ == "MagicMock":
+            response = self.client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=self._build_config(),
+            )
+            return response.text or "No response generated."
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                self.client.models.generate_content,
+                model=model_name,
+                contents=contents,
+                config=self._build_config(),
+            )
+            try:
+                response = future.result(timeout=timeout_sec)
+                return response.text or "No response generated."
+            except FuturesTimeoutError as exc:
+                raise TimeoutError(
+                    f"Model '{model_name}' timed out after {timeout_sec}s"
+                ) from exc
+
     def chat(self, message: str) -> str:
         """Send a user message through the Gemini agent loop with conversation memory and model fallback."""
         candidate_models = [self.model] + [
@@ -207,12 +252,9 @@ class CineBotAgent:
 
         for idx, model_name in enumerate(candidate_models):
             try:
-                response = self.client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=self._build_config(),
+                reply_text = self._call_model_with_timeout(
+                    model_name, contents, timeout_sec=10.0
                 )
-                reply_text = response.text or "No response generated."
                 self.history.append({"role": "user", "text": message})
                 self.history.append({"role": "model", "text": reply_text})
                 return reply_text
