@@ -6,6 +6,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+import requests
 
 from app.agent import run_agent
 from app.config import settings
@@ -54,6 +55,29 @@ def _try_plex_refresh() -> bool:
         return False
 
 
+def send_push_notification(title: str, body: str, tags: str = "popcorn,movie_camera") -> bool:
+    """Send a push notification via ntfy.sh if NTFY_TOPIC is configured."""
+    topic = (settings.NTFY_TOPIC or "").strip()
+    if not topic:
+        return False
+    base_url = (settings.NTFY_URL or "https://ntfy.sh").rstrip("/")
+    try:
+        resp = requests.post(
+            f"{base_url}/{topic}",
+            data=body.encode("utf-8"),
+            headers={
+                "Title": title,
+                "Priority": "high",
+                "Tags": tags,
+            },
+            timeout=5,
+        )
+        return resp.ok
+    except Exception as exc:
+        logger.debug("ntfy push notification skipped/failed: %s", exc)
+        return False
+
+
 @app.get("/health")
 def health_check() -> dict[str, Any]:
     """Return service health and current VPN binding status."""
@@ -62,6 +86,7 @@ def health_check() -> dict[str, Any]:
         "status": "ok",
         "vpn": dict(vpn),
         "root_folder": settings.PLEX_ROOT_FOLDER or "/data/Movies",
+        "ntfy_topic": settings.NTFY_TOPIC,
     }
 
 
@@ -69,7 +94,11 @@ def health_check() -> dict[str, Any]:
 def chat_endpoint(payload: ChatRequest) -> ChatResponse:
     """Accept a user message, run the Gemini agent loop with tool calling, and return the response."""
     try:
-        reply = run_agent(payload.message, payload.session_id) if payload.session_id else run_agent(payload.message)
+        reply = (
+            run_agent(payload.message, payload.session_id)
+            if payload.session_id
+            else run_agent(payload.message)
+        )
         vpn = verify_windscribe_binding()
         return ChatResponse(
             response=reply,
@@ -103,12 +132,22 @@ def radarr_webhook(payload: dict[str, Any]) -> dict[str, Any]:
             f"Downloading through Gluetun VPN (`{settings.VPN_INTERFACE}`)."
         )
         plex_refreshed = False
+        send_push_notification(
+            title=f"CineBot Grabbed: {title}{year_suffix}",
+            body=f"Downloading {title}{year_suffix} [{quality}] via Gluetun VPN (tun0).",
+            tags="clapper,arrow_down",
+        )
     elif event_type in ("Download", "MovieFileImport"):
         file_path = movie_file.get("path") or folder_path
         plex_refreshed = _try_plex_refresh()
         message = (
-            f"✅ **Imported to Plex**: *{title}{year_suffix}* is now available in "
-            f"`{file_path}` (Root: `/data/Movies`)."
+            f"🎉 **Download Complete & Imported to Plex**: *{title}{year_suffix}* is now ready to watch in "
+            f"`{file_path}`!"
+        )
+        send_push_notification(
+            title=f"Ready on Plex: {title}{year_suffix}",
+            body=f"{title}{year_suffix} has finished downloading and was imported to {file_path}!",
+            tags="white_check_mark,popcorn",
         )
     elif event_type == "Test":
         message = "🔔 **Radarr Webhook Test**: Connection to CineBot verified."

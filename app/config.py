@@ -50,5 +50,14 @@ class Settings(BaseSettings):
     )
     PLEX_TOKEN: str = Field(default="", description="Plex authentication token")
 
+    # Mobile Push Notifications (ntfy.sh)
+    NTFY_URL: str = Field(
+        default="https://ntfy.sh", description="ntfy push notification server URL"
+    )
+    NTFY_TOPIC: str = Field(
+        default="cinebot-plex-jw563",
+        description="ntfy topic name for mobile/browser push notifications",
+    )
+
 
 settings = Settings()
