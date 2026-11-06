@@ -214,13 +214,6 @@ async def on_check_queue_action(action: cl.Action) -> None:
     summary = format_queue_summary(queue_data, qbit_items)
     now_str = datetime.now().strftime("%I:%M:%S %p")
 
-    refresh_action = [
-        cl.Action(
-            name="check_queue",
-            payload={},
-            label="🔄 Refresh Download Status",
-        )
-    ]
     header_prefix: str = cl.user_session.get("queue_header_prefix", "")
     prefix_block = f"{header_prefix}\n\n" if header_prefix else ""
     updated_content = (
@@ -231,9 +224,15 @@ async def on_check_queue_action(action: cl.Action) -> None:
     existing_msg: cl.Message | None = cl.user_session.get("queue_status_msg")
     if existing_msg is not None:
         existing_msg.content = updated_content
-        existing_msg.actions = refresh_action
         await existing_msg.update()
     else:
+        refresh_action = [
+            cl.Action(
+                name="check_queue",
+                payload={},
+                label="🔄 Refresh Download Status",
+            )
+        ]
         new_msg = cl.Message(content=updated_content, actions=refresh_action)
         await new_msg.send()
         cl.user_session.set("queue_status_msg", new_msg)
