@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # LLM Configuration
     GEMINI_API_KEY: str = Field(default="", description="Google Gemini API key")
     GEMINI_MODEL: str = Field(
-        default="gemini-3.8-flash", description="Default Gemini model identifier"
+        default="gemini-3.7-flash", description="Default Gemini model identifier"
     )
 
     # Radarr v3 Configuration

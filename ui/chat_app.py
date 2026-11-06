@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
@@ -70,6 +71,9 @@ async def on_download_action(action: cl.Action) -> None:
     tmdb_id = int(action.payload.get("tmdbId", 0))
     title = action.payload.get("title", f"TMDB #{tmdb_id}")
 
+    status_msg = cl.Message(content=f"⏳ Verifying VPN and triggering download for **{title}**...")
+    await status_msg.send()
+
     result = await asyncio.to_thread(trigger_movie_download, tmdb_id)
     vpn_status = await asyncio.to_thread(verify_windscribe_binding)
     badge = format_vpn_badge(vpn_status)
@@ -88,7 +92,22 @@ async def on_download_action(action: cl.Action) -> None:
             f"🛑 **Download Aborted for {title}**: {result.get('error', 'VPN check failed.')}"
         )
 
-    await cl.Message(content=msg).send()
+    status_msg.content = msg
+    await status_msg.update()
+
+
+def _extract_search_query(user_text: str) -> str | None:
+    """Extract a movie search query from user text if the message looks like a movie lookup/request."""
+    lower = user_text.lower().strip()
+    if any(k in lower for k in ("queue", "status", "vpn", "progress", "eta", "help")):
+        return None
+    cleaned = re.sub(
+        r"^(please\s+)?(can\s+you\s+)?(search\s+for|search|find|lookup|look\s+up|get\s+me|download|add|watch)\s+",
+        "",
+        user_text.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    return cleaned or user_text.strip()
 
 
 @cl.on_message
@@ -99,18 +118,17 @@ async def on_message(message: cl.Message) -> None:
     agent: CineBotAgent = cl.user_session.get("agent") or CineBotAgent()
     user_text = message.content.strip()
 
+    thinking_msg = cl.Message(content="⏳ *CineBot is checking Radarr & VPN status...*")
+    await thinking_msg.send()
+
     vpn_status = await asyncio.to_thread(verify_windscribe_binding)
     badge = format_vpn_badge(vpn_status)
 
     elements: list[Any] = []
     actions: list[cl.Action] = []
 
-    # If the user is explicitly searching for a movie, also fetch poster thumbnails for rich UI display
-    lowered = user_text.lower()
-    if any(k in lowered for k in ("search ", "find ", "lookup ", "look up ")):
-        query_term = (
-            user_text.split(" ", 1)[1].strip() if " " in user_text else user_text
-        )
+    query_term = _extract_search_query(user_text)
+    if query_term:
         try:
             movies = await asyncio.to_thread(lookup_movie, query_term)
             for movie in movies[:3]:
@@ -137,12 +155,15 @@ async def on_message(message: cl.Message) -> None:
         except Exception as exc:
             logger.debug("Poster preview lookup skipped: %s", exc)
 
-    reply_text = await asyncio.to_thread(agent.chat, user_text)
-    full_content = f"{badge}\n\n{reply_text}"
+    try:
+        reply_text = await asyncio.to_thread(agent.chat, user_text)
+    except Exception as exc:
+        logger.exception("Chat error")
+        reply_text = f"⚠️ Error communicating with agent: `{exc}`"
 
-    await cl.Message(
-        content=full_content,
-        elements=elements,
-        actions=actions,
-    ).send()
+    thinking_msg.content = f"{badge}\n\n{reply_text}"
+    thinking_msg.elements = elements
+    thinking_msg.actions = actions
+    await thinking_msg.update()
+
     await flush_webhook_notifications()
