@@ -96,9 +96,43 @@ async def on_download_action(action: cl.Action) -> None:
     await status_msg.update()
 
 
+CONVERSATIONAL_REPLIES = {
+    "yes",
+    "y",
+    "yeah",
+    "yep",
+    "yup",
+    "sure",
+    "ok",
+    "okay",
+    "do it",
+    "download",
+    "download it",
+    "please",
+    "yes please",
+    "go ahead",
+    "confirm",
+    "no",
+    "nope",
+    "cancel",
+    "stop",
+    "thanks",
+    "thank you",
+    "1",
+    "2",
+    "3",
+    "first",
+    "the first one",
+    "second",
+    "the second one",
+}
+
+
 def _extract_search_query(user_text: str) -> str | None:
     """Extract a movie search query from user text if the message looks like a movie lookup/request."""
-    lower = user_text.lower().strip()
+    lower = user_text.lower().strip().rstrip(".!?")
+    if not lower or lower in CONVERSATIONAL_REPLIES:
+        return None
     if any(k in lower for k in ("queue", "status", "vpn", "progress", "eta", "help")):
         return None
     cleaned = re.sub(
@@ -107,6 +141,8 @@ def _extract_search_query(user_text: str) -> str | None:
         user_text.strip(),
         flags=re.IGNORECASE,
     ).strip()
+    if cleaned.lower().rstrip(".!?") in CONVERSATIONAL_REPLIES:
+        return None
     return cleaned or user_text.strip()
 
 

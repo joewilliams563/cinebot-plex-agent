@@ -69,7 +69,7 @@ def health_check() -> dict[str, Any]:
 def chat_endpoint(payload: ChatRequest) -> ChatResponse:
     """Accept a user message, run the Gemini agent loop with tool calling, and return the response."""
     try:
-        reply = run_agent(payload.message)
+        reply = run_agent(payload.message, payload.session_id) if payload.session_id else run_agent(payload.message)
         vpn = verify_windscribe_binding()
         return ChatResponse(
             response=reply,
