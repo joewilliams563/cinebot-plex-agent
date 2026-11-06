@@ -44,7 +44,7 @@ class CineBotAgent:
     """Stateful or single-turn Gemini agent with automatic function calling."""
 
     def __init__(self, model: str | None = None) -> None:
-        self.model = model or settings.GEMINI_MODEL or "gemini-2.5-flash"
+        self.model = model or settings.GEMINI_MODEL or "gemini-3.8-flash"
         self._client: genai.Client | None = None
 
     @property

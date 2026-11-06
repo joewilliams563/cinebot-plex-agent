@@ -24,7 +24,7 @@ class VPNStatus(dict):
         return super().__eq__(other)
 
 
-def _extract_vpn_ip(client: Any, prefs: dict[str, Any]) -> tuple[str | None, bool]:
+def _extract_vpn_ip(client: Any, prefs: dict[str, Any], iface: str = "") -> tuple[str | None, bool]:
     """Extract and validate the active VPN IP from qBittorrent preferences or transfer info."""
     for key in (
         "current_interface_address",
@@ -32,12 +32,24 @@ def _extract_vpn_ip(client: Any, prefs: dict[str, Any]) -> tuple[str | None, boo
         "vpn_ip",
         "external_ip",
     ):
-        if key in prefs:
-            raw_ip = prefs.get(key)
-            ip_str = str(raw_ip or "").strip()
-            if ip_str.lower() in INVALID_IPS:
-                return ip_str or None, False
+        raw_ip = prefs.get(key)
+        ip_str = str(raw_ip or "").strip()
+        if ip_str and ip_str.lower() not in INVALID_IPS:
             return ip_str, True
+        if ip_str and ip_str.lower() in ("0.0.0.0", "127.0.0.1", "::1", "localhost"):
+            return ip_str, False
+
+    # Query qBittorrent for live IP addresses assigned to the bound interface (e.g. tun0)
+    target_iface = iface or prefs.get("current_network_interface") or prefs.get("current_interface_name") or ""
+    if target_iface:
+        try:
+            addr_list = client.app_network_interface_address_list(str(target_iface))
+            for addr in addr_list:
+                addr_str = str(addr or "").strip()
+                if addr_str and addr_str.lower() not in INVALID_IPS:
+                    return addr_str, True
+        except Exception:
+            pass
 
     # Try inspecting transfer_info if available on the client
     try:
@@ -85,7 +97,11 @@ def verify_windscribe_binding() -> VPNStatus:
             username=settings.QBIT_USER,
             password=settings.QBIT_PASS,
         )
-        client.auth_log_in()
+        try:
+            client.auth_log_in()
+        except Exception:
+            # Subnet whitelist bypass permits calls without authentication
+            pass
         prefs = client.app_preferences()
 
         current_iface = str(prefs.get("current_network_interface", "") or "").strip()
@@ -104,7 +120,7 @@ def verify_windscribe_binding() -> VPNStatus:
             )
         )
 
-        vpn_ip, ip_ok = _extract_vpn_ip(client, prefs)
+        vpn_ip, ip_ok = _extract_vpn_ip(client, prefs, detected_iface)
         is_bound = bool(interface_ok and ip_ok)
 
         if is_bound:
