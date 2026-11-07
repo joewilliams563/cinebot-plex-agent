@@ -33,7 +33,8 @@ services:
       - WEBUI_PORT=8080
     volumes:
       - ./config/qbittorrent:/config
-      - C:/PlexMedia:/data # Shared root volume so Radarr hardlinks work instantly
+      - C:/PlexMedia:/data # Staging root for /data/torrents (invisible to Plex)
+      - C:/Users/joewi/Videos:/data/Movies # Direct mount to existing Plex Movies library
     depends_on:
       gluetun:
         condition: service_healthy
@@ -65,7 +66,8 @@ services:
       - TZ=America/New_York
     volumes:
       - ./config/radarr:/config
-      - C:/PlexMedia:/data # Matches qBittorrent's /data mount for instant hardlinks
+      - C:/PlexMedia:/data # Staging root for /data/torrents
+      - C:/Users/joewi/Videos:/data/Movies # Direct mount to existing Plex Movies library
     restart: unless-stopped
 
   # 5. CineBot AI Agent & Chat UI
@@ -84,6 +86,11 @@ services:
       - PLEX_ROOT_FOLDER=/data/Movies
       - VPN_INTERFACE=tun0
       - PLEX_URL=http://host.docker.internal:32400 # Reaches Plex running on Windows host
+    volumes:
+      - ./app:/workspace/app
+      - ./tools:/workspace/tools
+      - ./ui:/workspace/ui
+      - ./tests:/workspace/tests
     depends_on:
       - radarr
       - gluetun
