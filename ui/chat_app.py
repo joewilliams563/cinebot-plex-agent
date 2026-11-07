@@ -60,7 +60,14 @@ CONVERSATIONAL_REPLIES = {
     "the second one",
 }
 
-COMPLETED_STATES = {"uploading", "stalledup", "pausedup", "queuedup", "checkingup", "forcedup"}
+COMPLETED_STATES = {
+    "uploading",
+    "stalledup",
+    "pausedup",
+    "queuedup",
+    "checkingup",
+    "forcedup",
+}
 
 
 def format_vpn_badge(vpn_status: dict[str, Any]) -> str:
@@ -90,6 +97,15 @@ def _format_eta(seconds: int | None, fallback: str = "Calculating...") -> str:
     return f"{mins:02d}:{secs:02d}"
 
 
+def _format_bytes(num_bytes: float) -> str:
+    """Format byte count as MB or GB."""
+    gb = num_bytes / (1024**3)
+    if gb >= 1.0:
+        return f"{gb:.2f} GB"
+    mb = num_bytes / (1024**2)
+    return f"{mb:.1f} MB"
+
+
 def _fetch_live_qbit_torrents() -> list[dict[str, Any]]:
     """Query qBittorrent directly for real-time torrent progress, speed, seeds, and state."""
     try:
@@ -106,16 +122,20 @@ def _fetch_live_qbit_torrents() -> list[dict[str, Any]]:
         torrents = client.torrents_info()
         results: list[dict[str, Any]] = []
         for t in torrents:
-            pct = round(float(getattr(t, "progress", 0.0)) * 100.0, 1)
+            pct = round(float(getattr(t, "progress", 0.0)) * 100.0, 2)
             state_str = str(getattr(t, "state", "downloading"))
             is_complete = pct >= 100.0 or state_str.lower() in COMPLETED_STATES
             dlspeed_mb = round(float(getattr(t, "dlspeed", 0.0)) / (1024 * 1024), 2)
+            downloaded = float(getattr(t, "downloaded", 0.0) or 0.0)
+            total_size = float(getattr(t, "size", 0.0) or getattr(t, "total_size", 0.0) or 0.0)
             eta_sec = getattr(t, "eta", None)
             results.append(
                 {
                     "hash": getattr(t, "hash", ""),
                     "name": getattr(t, "name", "Unknown"),
                     "progress_percent": pct,
+                    "downloaded_str": _format_bytes(downloaded),
+                    "total_size_str": _format_bytes(total_size),
                     "state": "completed (ready on Plex)" if is_complete else state_str,
                     "is_complete": is_complete,
                     "dlspeed_mb": dlspeed_mb,
@@ -139,13 +159,16 @@ def format_queue_summary(
     active_qbit = [t for t in qbit_items if not t.get("is_complete")]
 
     if active_qbit:
-        lines = [f"📥 **Active Downloads ({len(active_qbit)})** *(auto-updating every 5s)*:"]
+        lines = [
+            f"📥 **Active Downloads ({len(active_qbit)})** *(auto-updating every 5s)*:"
+        ]
         for t in active_qbit:
             pct = t["progress_percent"]
             bar = _render_progress_bar(pct)
+            size_info = f"{t.get('downloaded_str', '0 MB')} / {t.get('total_size_str', '? GB')}"
             lines.append(
                 f"- **{t['name']}**\n"
-                f"  `{bar}` **{pct}%** | Speed: `{t['dlspeed_mb']} MB/s` | "
+                f"  `{bar}` **{pct:.2f}%** (`{size_info}`) | Speed: `{t['dlspeed_mb']} MB/s` | "
                 f"Seeds: `{t['seeds']}` | State: `{t['state']}` | ETA: `{t['eta']}`"
             )
         return "\n".join(lines)
@@ -165,7 +188,7 @@ def format_queue_summary(
         bar = _render_progress_bar(pct)
         lines.append(
             f"- **{item.get('title')}**\n"
-            f"  `{bar}` **{pct}%** | State: `{item.get('trackedDownloadState') or item.get('status')}` "
+            f"  `{bar}` **{pct:.2f}%** | State: `{item.get('trackedDownloadState') or item.get('status')}` "
             f"| ETA: `{item.get('timeleft', 'Calculating...')}`"
         )
     return "\n".join(lines)
@@ -200,7 +223,6 @@ async def flush_webhook_notifications() -> None:
 async def _background_download_watcher() -> None:
     """Background task that auto-updates download progress in-place and pushes completion alerts."""
     notified_hashes: set[str] = set()
-    # Pre-populate already completed torrents on startup so we only notify on newly finished ones
     initial_torrents = await asyncio.to_thread(_fetch_live_qbit_torrents)
     for t in initial_torrents:
         if t.get("is_complete") and t.get("hash"):
@@ -224,9 +246,9 @@ async def _background_download_watcher() -> None:
                 else:
                     has_active = True
 
-            # Update the in-place status message automatically when downloads are active or just finished
             existing_msg: cl.Message | None = cl.user_session.get("queue_status_msg")
-            if existing_msg is not None and (has_active or newly_completed):
+
+            if has_active or newly_completed:
                 if not has_active:
                     cl.user_session.set("queue_header_prefix", "")
                 vpn_status = await asyncio.to_thread(verify_windscribe_binding)
@@ -236,31 +258,52 @@ async def _background_download_watcher() -> None:
                 now_str = datetime.now().strftime("%I:%M:%S %p")
                 header_prefix: str = cl.user_session.get("queue_header_prefix", "")
                 prefix_block = f"{header_prefix}\n\n" if header_prefix else ""
-                existing_msg.content = (
+                updated_content = (
                     f"{badge} | 🕒 *Auto-updated: `{now_str}`*\n\n"
                     f"{prefix_block}{summary}"
                 )
-                await existing_msg.update()
 
-            # Send an instant chat alert + ntfy mobile push notification for newly completed downloads
+                if existing_msg is not None:
+                    existing_msg.content = updated_content
+                    await existing_msg.update()
+                else:
+                    refresh_action = [
+                        cl.Action(
+                            name="check_queue",
+                            payload={},
+                            label="🔄 Refresh Download Status",
+                        )
+                    ]
+                    new_msg = cl.Message(content=updated_content, actions=refresh_action)
+                    await new_msg.send()
+                    cl.user_session.set("queue_status_msg", new_msg)
+
             for comp in newly_completed:
                 name = comp.get("name", "Movie")
                 await cl.Message(
                     content=(
                         f"🎉 **Download Complete!**\n"
-                        f"**{name}** has reached **100%** and been imported to `/data/Movies` (`C:\\PlexMedia\\Movies`). Ready to watch on Plex!"
+                        f"**{name}** has reached **100%** and been imported to `/data/Movies` (`C:\\Users\\joewi\\Videos`). Ready to watch on Plex!"
                     )
                 ).send()
                 await asyncio.to_thread(
                     send_push_notification,
                     "🍿 CineBot: Download Complete!",
-                    f"{name} has finished downloading (100%) and is ready in /data/Movies on Plex!",
+                    f"{name} has finished downloading (100%) and is ready in your Plex Movies library!",
                     "white_check_mark,popcorn",
                 )
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.debug("Background watcher iteration warning: %s", exc)
+            logger.warning("Background watcher warning: %s", exc)
+
+
+def _ensure_watcher_running() -> None:
+    """Ensure the 5-second background download watcher task is active in the current session."""
+    watcher_task: asyncio.Task[Any] | None = cl.user_session.get("watcher_task")
+    if watcher_task is None or watcher_task.done():
+        new_task = asyncio.create_task(_background_download_watcher())
+        cl.user_session.set("watcher_task", new_task)
 
 
 @cl.on_chat_start
@@ -277,7 +320,7 @@ async def on_chat_start() -> None:
 
     welcome_md = (
         f"# 🍿 Welcome to CineBot\n"
-        f"{badge} | 📁 **Plex Root**: `{root_folder}`\n"
+        f"{badge} | 📁 **Plex Root**: `{root_folder}` (`C:\\Users\\joewi\\Videos`)\n"
         f"🔔 **Mobile Push Topic**: [`{ntfy_url}`]({ntfy_url})\n\n"
         "Ask me to search for a movie, download a title by name or TMDB ID, "
         "or check your active Radarr/qBittorrent download queue."
@@ -292,9 +335,7 @@ async def on_chat_start() -> None:
     welcome_msg = cl.Message(content=welcome_md, actions=actions)
     await welcome_msg.send()
 
-    # Launch hands-free background watcher for live progress & completion alerts
-    watcher_task = asyncio.create_task(_background_download_watcher())
-    cl.user_session.set("watcher_task", watcher_task)
+    _ensure_watcher_running()
 
 
 @cl.on_chat_end
@@ -308,6 +349,7 @@ async def on_chat_end() -> None:
 @cl.action_callback("check_queue")
 async def on_check_queue_action(action: cl.Action) -> None:
     """Update the existing download status message in-place instead of appending new messages."""
+    _ensure_watcher_running()
     vpn_status = await asyncio.to_thread(verify_windscribe_binding)
     badge = format_vpn_badge(vpn_status)
     queue_data, qbit_items = await asyncio.gather(
@@ -346,6 +388,7 @@ async def on_check_queue_action(action: cl.Action) -> None:
 @cl.action_callback("download_movie")
 async def on_download_action(action: cl.Action) -> None:
     """Handle one-click movie download button from search results with mandatory VPN check."""
+    _ensure_watcher_running()
     tmdb_id = int(action.payload.get("tmdbId", 0))
     title = action.payload.get("title", f"TMDB #{tmdb_id}")
 
@@ -369,7 +412,7 @@ async def on_download_action(action: cl.Action) -> None:
         header_info = (
             f"✅ **Movie Added & Search Triggered**: **{result.get('title', title)} "
             f"({result.get('year', '')})** (`tmdbId={tmdb_id}`)\n"
-            f"- **Plex Destination**: `{result.get('rootFolderPath', '/data/Movies')}`\n"
+            f"- **Plex Destination**: `{result.get('rootFolderPath', '/data/Movies')}` (`C:\\Users\\joewi\\Videos`)\n"
             f"- **Monitored**: `{result.get('monitored', True)}` | **Download Client**: `qBittorrent (Gluetun tun0)`"
         )
         cl.user_session.set("queue_header_prefix", header_info)
@@ -422,6 +465,7 @@ def _extract_search_query(user_text: str) -> str | None:
 @cl.on_message
 async def on_message(message: cl.Message) -> None:
     """Process incoming chat messages, showing immediate Radarr search results before the LLM finishes."""
+    _ensure_watcher_running()
     await flush_webhook_notifications()
 
     agent: CineBotAgent = cl.user_session.get("agent") or CineBotAgent()
