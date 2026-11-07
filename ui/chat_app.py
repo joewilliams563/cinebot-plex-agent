@@ -134,42 +134,30 @@ def format_queue_summary(
     queue_data: dict[str, Any],
     qbit_items: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Format active and recently completed downloads into a clear Markdown summary."""
+    """Format only currently active downloads into a clear Markdown summary."""
     qbit_items = qbit_items or []
-    radarr_items = queue_data.get("queue", [])
+    active_qbit = [t for t in qbit_items if not t.get("is_complete")]
 
-    if qbit_items:
-        active = [t for t in qbit_items if not t.get("is_complete")]
-        completed = [t for t in qbit_items if t.get("is_complete")]
-        lines: list[str] = []
-
-        if active:
-            lines.append(f"📥 **Active Downloads ({len(active)})** *(auto-updating every 5s)*:")
-            for t in active:
-                pct = t["progress_percent"]
-                bar = _render_progress_bar(pct)
-                lines.append(
-                    f"- **{t['name']}**\n"
-                    f"  `{bar}` **{pct}%** | Speed: `{t['dlspeed_mb']} MB/s` | "
-                    f"Seeds: `{t['seeds']}` | State: `{t['state']}` | ETA: `{t['eta']}`"
-                )
-        if completed:
-            if lines:
-                lines.append("")
-            lines.append(f"✅ **Completed & Imported to Plex ({len(completed)})**:")
-            for t in completed:
-                bar = _render_progress_bar(100.0)
-                lines.append(
-                    f"- **{t['name']}**\n"
-                    f"  `{bar}` **100.0%** | Status: `Ready in /data/Movies (Plex)`"
-                )
+    if active_qbit:
+        lines = [f"📥 **Active Downloads ({len(active_qbit)})** *(auto-updating every 5s)*:"]
+        for t in active_qbit:
+            pct = t["progress_percent"]
+            bar = _render_progress_bar(pct)
+            lines.append(
+                f"- **{t['name']}**\n"
+                f"  `{bar}` **{pct}%** | Speed: `{t['dlspeed_mb']} MB/s` | "
+                f"Seeds: `{t['seeds']}` | State: `{t['state']}` | ETA: `{t['eta']}`"
+            )
         return "\n".join(lines)
 
+    radarr_items = [
+        item
+        for item in queue_data.get("queue", [])
+        if float(item.get("progress_percent", 0.0)) < 100.0
+        and str(item.get("status", "")).lower() != "completed"
+    ]
     if not radarr_items:
-        return (
-            "📡 **Radarr & qBittorrent Status**: No active downloads in queue "
-            "(either searching indexers or already imported into `/data/Movies`)."
-        )
+        return "📭 **Active Downloads (0)**: All finished downloads have been imported to Plex (`/data/Movies`)."
 
     lines = [f"📥 **Active Downloads ({len(radarr_items)})**:"]
     for item in radarr_items:
@@ -239,6 +227,8 @@ async def _background_download_watcher() -> None:
             # Update the in-place status message automatically when downloads are active or just finished
             existing_msg: cl.Message | None = cl.user_session.get("queue_status_msg")
             if existing_msg is not None and (has_active or newly_completed):
+                if not has_active:
+                    cl.user_session.set("queue_header_prefix", "")
                 vpn_status = await asyncio.to_thread(verify_windscribe_binding)
                 badge = format_vpn_badge(vpn_status)
                 queue_data = await asyncio.to_thread(get_download_queue)
