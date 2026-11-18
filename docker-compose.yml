@@ -75,8 +75,8 @@ services:
     build: .
     container_name: cinebot
     ports:
-      - "8000:8000" # FastAPI Webhook & API
-      - "8501:8501" # Chainlit Chat Frontend
+      - "8001:8000" # FastAPI Webhook & API (mapped to 8001 so 8000 stays free for SmartyPants AI)
+      - "8502:8501" # Chainlit Chat Frontend (mapped to 8502 so 8501 stays free for SmartyPants AI)
     env_file:
       - .env
     environment:
